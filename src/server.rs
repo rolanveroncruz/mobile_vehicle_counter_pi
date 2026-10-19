@@ -25,14 +25,8 @@ use crate::handlers::locations;
 use crate::handlers::locations::{create_location, delete_location, get_all_locations};
 use crate::handlers::login::login_handler;
 use crate::handlers::middleware::auth_middleware;
-#[derive(Debug, Deserialize)]
-struct AlprPayload {
-    camid: String,
-    date: String,
-    plate: String,
-    plate_image: String,
-    image: String,
-}
+use crate::handlers::events::get_binned_events;
+use crate::handlers::sublocations::{create_sublocation, delete_sublocation, get_sublocations_by_location};
 
 pub fn build_app(state: AppState)->Router<AppState>{
 
@@ -45,6 +39,10 @@ pub fn build_app(state: AppState)->Router<AppState>{
     let protected_routes = Router::<AppState>::new()
         .route("/api/locations", get(get_all_locations).post(create_location))
         .route("/api/locations/{id}", delete(delete_location))
+        .route("/api/binned_events", post(get_binned_events))
+        .route("/api/locations/{location_id}/sublocations", get(get_sublocations_by_location))
+        .route("/api/sublocations", post(create_sublocation))
+        .route("/api/sublocations/{id}", delete(delete_sublocation))
         .route_layer(middleware::from_fn(auth_middleware));
 
     let app = Router::new()
