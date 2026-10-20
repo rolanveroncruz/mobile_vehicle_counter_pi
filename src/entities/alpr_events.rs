@@ -9,7 +9,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub camera_id: String,
-    pub date: DateTime,
+    pub date: DateTimeWithTimeZone,
     pub plate: String,
     pub image: String,
     pub plate_image: String,

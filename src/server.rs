@@ -25,7 +25,7 @@ use crate::handlers::locations;
 use crate::handlers::locations::{create_location, delete_location, get_all_locations};
 use crate::handlers::login::login_handler;
 use crate::handlers::middleware::auth_middleware;
-use crate::handlers::events::get_binned_events;
+use crate::handlers::events::{get_time_limits, get_binned_events, get_bin_event_details};
 use crate::handlers::sublocations::{create_sublocation, delete_sublocation, get_sublocations_by_location};
 
 pub fn build_app(state: AppState)->Router<AppState>{
@@ -39,7 +39,9 @@ pub fn build_app(state: AppState)->Router<AppState>{
     let protected_routes = Router::<AppState>::new()
         .route("/api/locations", get(get_all_locations).post(create_location))
         .route("/api/locations/{id}", delete(delete_location))
+        .route("/api/time_limits", post(get_time_limits))
         .route("/api/binned_events", post(get_binned_events))
+        .route("/api/bin_events_details", post(get_bin_event_details))
         .route("/api/locations/{location_id}/sublocations", get(get_sublocations_by_location))
         .route("/api/sublocations", post(create_sublocation))
         .route("/api/sublocations/{id}", delete(delete_sublocation))

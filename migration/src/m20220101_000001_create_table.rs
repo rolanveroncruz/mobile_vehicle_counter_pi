@@ -159,7 +159,7 @@ impl Migration {
                         .on_update(ForeignKeyAction::Restrict)
                     )
                     .col(ColumnDef::new(AlprEvents::Date)
-                        .date_time()
+                        .timestamp_with_time_zone()
                         .not_null()
                     )
                     .col(ColumnDef::new(AlprEvents::Plate)

@@ -1,12 +1,68 @@
 use axum::{extract::State, Json};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Timelike};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, };
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder };
 use serde::{Deserialize, Serialize};
 
 // Assuming these are imported from your entity modules
 use crate::entities::{alpr_events, camera};
 use crate::handlers::app_state::AppState;
 
+
+
+// region: Get_time_limits
+#[derive(Deserialize, Debug)]
+pub struct TimeLimitsRequest {
+    pub sublocation_ids: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct TimeLimitsResponse {
+    pub earliest_datetime: Option<DateTime<FixedOffset>>,
+    pub latest_datetime: Option<DateTime<FixedOffset>>,
+}
+
+/// POST /api/time_limits
+pub async fn get_time_limits(
+    State(state): State<AppState>,
+    Json(payload): Json<TimeLimitsRequest>,
+) -> Result<Json<TimeLimitsResponse>, axum::http::StatusCode> {
+
+    // Fetch the earliest event
+    let earliest_event = alpr_events::Entity::find()
+        .inner_join(camera::Entity)
+        .filter(camera::Column::SublocationId.is_in(payload.sublocation_ids.clone()))
+        .order_by_asc(alpr_events::Column::Date)
+        .one(&state.db_conn)
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to fetch earliest time limit: {}", error);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Fetch the latest event
+    let latest_event = alpr_events::Entity::find()
+        .inner_join(camera::Entity)
+        .filter(camera::Column::SublocationId.is_in(payload.sublocation_ids))
+        .order_by_desc(alpr_events::Column::Date)
+        .one(&state.db_conn)
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to fetch latest time limit: {}", error);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Map the fetched records to their dates. If no events exist, they return None.
+    let response = TimeLimitsResponse {
+        earliest_datetime: earliest_event.map(|e| e.date),
+        latest_datetime: latest_event.map(|e| e.date),
+    };
+
+    Ok(Json(response))
+}
+
+// endregion: Get_time_limits
+
+// region: Get_binned_events
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum BinInterval {
@@ -42,8 +98,8 @@ pub async fn get_binned_events(
     let events = alpr_events::Entity::find()
         .inner_join(camera::Entity)
         .filter(camera::Column::SublocationId.is_in(payload.sublocation_ids))
-        .filter(alpr_events::Column::Date.gte(payload.start_datetime.naive_local()))
-        .filter(alpr_events::Column::Date.lt(payload.end_datetime.naive_local()))
+        .filter(alpr_events::Column::Date.gte(payload.start_datetime))
+        .filter(alpr_events::Column::Date.lt(payload.end_datetime))
         .all(&state.db_conn)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -76,7 +132,7 @@ pub async fn get_binned_events(
     for event in events {
         // Find the bin where: bin.start_time <= event.date < bin.end_time
         if let Some(bin) = bins.iter_mut().find(|b| {
-            event.date >= b.start_time.naive_local() && event.date < b.end_time.naive_local()
+            event.date >= b.start_time && event.date < b.end_time
         }) {
             bin.count += 1;
         }
@@ -126,3 +182,36 @@ fn advance_time(current: &DateTime<FixedOffset>, interval: &BinInterval) -> Date
         }
     }
 }
+// endregion: Get_binned_events
+
+// region: Get_binned_events
+#[derive(Deserialize, Debug)]
+pub struct EventDetailsRequest {
+    pub sublocation_ids: Vec<String>,
+    pub start_datetime: DateTime<FixedOffset>,
+    pub end_datetime: DateTime<FixedOffset>,
+}
+
+pub async fn get_bin_event_details(
+    State(state): State<AppState>,
+    Json(payload): Json<EventDetailsRequest>,
+) -> Result<Json<Vec<alpr_events::Model>>, axum::http::StatusCode> {
+
+    let events = alpr_events::Entity::find()
+        .inner_join(camera::Entity)
+        .filter(camera::Column::SublocationId.is_in(payload.sublocation_ids))
+        .filter(alpr_events::Column::Date.gte(payload.start_datetime))
+        .filter(alpr_events::Column::Date.lt(payload.end_datetime))
+        .order_by_desc(alpr_events::Column::Date) // Optional: returns newest events first
+        .all(&state.db_conn)
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to fetch event details: {}", error);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        Ok(Json(events))
+}
+
+
+// endregion: Get_binned_events
