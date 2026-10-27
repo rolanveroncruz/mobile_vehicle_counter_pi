@@ -1,1 +1,5 @@
 /target
+.idea/
+images/
+out/
+migration/target

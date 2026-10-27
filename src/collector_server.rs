@@ -17,13 +17,14 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::DateTime;
 use dotenvy::dotenv;
-use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::db;
 use crate::entities::{alpr_events, camera};
 
 /// State for the data collector server.
@@ -63,7 +64,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env file");
     println!("DATABASE_URL is:{}", db_url);
-    let db_conn = Database::connect(&db_url).await?;
+    let db_conn = db::connect(&db_url).await?;
 
     // ------------------------
     // 3. Prepare the image output directory
@@ -85,7 +86,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_collector_server().layer(cors).with_state(state);
 
     // The frontend api server uses port 3000, so the collector uses its own.
-    let addr = env::var("COLLECTOR_PORT").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
+    let addr = env::var("COLLECTOR_ADDR").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
     println!("Data collector server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 

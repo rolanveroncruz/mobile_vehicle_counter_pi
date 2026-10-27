@@ -7,10 +7,10 @@ use axum::{
     Router, middleware,
     routing::{get, post},
 };
-use sea_orm::Database;
 
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::db;
 use crate::handlers::app_state::AppState;
 use crate::handlers::events::{get_bin_event_details, get_binned_events, get_time_limits};
 use crate::handlers::locations::{create_location, delete_location, get_all_locations};
@@ -62,7 +62,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Read the DATABASE_URL and connect
     // ------------------------
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env file");
-    let db_conn = Database::connect(&db_url).await?;
+    let db_conn = db::connect(&db_url).await?;
 
     let state = AppState { db_conn };
 
