@@ -1,28 +1,18 @@
-#![allow(dead_code, unused)]
 use dotenvy::dotenv;
 use std::env;
 
 use axum::http::Method;
 use axum::routing::delete;
 use axum::{
-    Json, Router,
-    body::Bytes,
-    extract::State,
-    http::{StatusCode, header},
-    middleware,
-    response::IntoResponse,
+    Router, middleware,
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use sea_orm::{Database, Iden};
-use serde::{Deserialize, Serialize};
+use sea_orm::Database;
 
 use tower_http::cors::{Any, CorsLayer};
-use uuid::Uuid;
 
 use crate::handlers::app_state::AppState;
 use crate::handlers::events::{get_bin_event_details, get_binned_events, get_time_limits};
-use crate::handlers::locations;
 use crate::handlers::locations::{create_location, delete_location, get_all_locations};
 use crate::handlers::login::login_handler;
 use crate::handlers::middleware::auth_middleware;
@@ -30,7 +20,7 @@ use crate::handlers::sublocations::{
     create_sublocation, delete_sublocation, get_sublocations_by_location,
 };
 
-pub fn build_app(state: AppState) -> Router<AppState> {
+pub fn build_app(_state: AppState) -> Router<AppState> {
     // -----------------------
     // 3. Setup axum server
     // -----------------------

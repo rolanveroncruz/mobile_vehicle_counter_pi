@@ -2,7 +2,7 @@
 name = "mobile_vehicle_counter_server"
 version = "0.1.0"
 edition = "2024"
-default-run = "mobile_vehicle_counter_server"
+default-run = "frontend_api"
 
 [dependencies]
 axum = "0.8.9"

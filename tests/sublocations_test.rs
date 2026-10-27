@@ -7,7 +7,7 @@ use dotenvy::dotenv;
 
 // Import from your library crate
 use mobile_vehicle_counter_server::handlers::app_state::AppState;
-use mobile_vehicle_counter_server::server::build_app;
+use mobile_vehicle_counter_server::api_server::build_app;
 use mobile_vehicle_counter_server::entities::location::Model as LocationModel;
 use mobile_vehicle_counter_server::entities::sublocation::Model as SublocationModel;
 
