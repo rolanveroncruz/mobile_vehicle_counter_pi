@@ -54,6 +54,20 @@ Known items that were deliberately deferred. Nothing here is blocking.
       until the collector has been started once. Switch them to a temporary database created
       through `db::connect(.., MissingDatabase::CreateAndMigrate)`.
 
+## Retry protocol
+
+- [ ] **No test over real HTTP.** `tests/collector_test.rs` calls `process_event()` directly, so
+      routing, the 20 MB body limit and the `Content-Type` of the reply are only checked by
+      hand. A small test that builds the router (`build_collector_server`) and sends requests
+      with `tower::ServiceExt::oneshot` would close that gap.
+- [ ] **Duplicate vs. conflict by raw bytes.** Because the hash is over raw bytes, the same
+      event re-serialised differently (key order, spacing, an uppercase UUID) is a `409`, not a
+      duplicate. That is deliberate (see README_PI.md: resend the saved bytes) but strict; if
+      the Pi cannot guarantee byte-identical retries, consider hashing a canonical form instead.
+- [ ] **No clean-up of orphaned images.** A crash between writing the image files and the
+      database insert leaves two files that no row refers to. A retry reuses (overwrites) the
+      same filenames, so these only remain if the Pi never retries that event.
+
 ## Operations
 
 - [ ] **No graceful shutdown.** Both servers call `axum::serve(listener, app)` without

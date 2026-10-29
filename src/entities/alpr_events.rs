@@ -13,6 +13,13 @@ pub struct Model {
     pub plate: String,
     pub image: String,
     pub plate_image: String,
+    /// SHA-256 (lowercase hex) of the raw POST body, set by the collector.
+    /// NULL for rows that predate the retry protocol. Hand-added to the
+    /// generated entity: it is part of the Pi protocol, not frontend data, so it
+    /// is skipped when the model is serialised (keeps the frontend API response
+    /// unchanged). If you regenerate this file, re-apply `serde(skip)`.
+    #[serde(skip)]
+    pub content_hash: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

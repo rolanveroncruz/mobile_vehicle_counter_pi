@@ -1,10 +1,17 @@
 /*
- * This file contains 4 functions related to accepting POST-ed data from raspberry pi deployments.
+ * This file contains the functions related to accepting POST-ed data from raspberry pi deployments.
  * 1. run_server() - this reads environment files to configure the database url and the address of the server.
  * 2. build_collector_server() - returns a Router which responds only to '/api/alpr/event'
  * using the handler alpr_webhook_handler().
- * 3. aplr_webhook_handler()-
- * 4. decode_and_save_images_to_files()-
+ * 3. aplr_webhook_handler()- thin HTTP wrapper around process_event().
+ * 4. process_event() - validates, de-duplicates and stores one event (see below).
+ * 5. decode_and_save_images_to_files()-
+ *
+ * Retry / duplicate protocol (full spec: README_PI.md):
+ * - The Pi generates the `event_id` (a UUID) and may POST the same event many times.
+ * - The server stores the SHA-256 of the raw request body as `content_hash` and returns it.
+ * - Same event_id + same hash   => duplicate of a stored event: 200, `duplicate: true`.
+ * - Same event_id + other hash  => the Pi reused an id for different data: 409.
  */
 use axum::{
     Router,
@@ -18,7 +25,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::DateTime;
 use dotenvy::dotenv;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::path::PathBuf;
 use tower_http::cors::{Any, CorsLayer};
@@ -47,6 +55,10 @@ pub struct CollectorState {
 
 #[derive(Debug, Deserialize)]
 struct AlprPayload {
+    /// Pi-generated UUID identifying this event. It is the primary key, so a
+    /// retry of the same event must send the same value. It is also used in the
+    /// image filenames, which is why it is validated as a UUID.
+    event_id: String,
     camid: String,
     /// RFC 3339 timestamp, e.g. `2026-10-09T16:44:25.443+08:00`.
     date: String,
@@ -124,6 +136,46 @@ async fn find_camera(
     camera::Entity::find_by_id(camid.to_string()).one(db).await
 }
 
+/// Body of a successful (`200`) response.
+///
+/// `content_hash` is the SHA-256 (lowercase hex) of the raw request body that the
+/// server stored. The Pi computes the same hash over the bytes it sent and treats
+/// the event as delivered only if the two match.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventAck {
+    pub event_id: String,
+    pub content_hash: String,
+    /// `true` if this event had already been stored by an earlier POST.
+    pub duplicate: bool,
+}
+
+/// The outcome of `process_event`: a status code and a body. Success bodies are
+/// JSON (`EventAck`); error bodies are plain text, as before.
+pub type EventResponse = (StatusCode, String);
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn content_hash(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn ack_response(event_id: String, content_hash: String, duplicate: bool) -> EventResponse {
+    let ack = EventAck {
+        event_id,
+        content_hash,
+        duplicate,
+    };
+    match serde_json::to_string(&ack) {
+        Ok(json) => (StatusCode::OK, json),
+        Err(error) => {
+            eprintln!("Failed to serialise ack: {}", error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build response".to_string(),
+            )
+        }
+    }
+}
+
 // handler for a POST-ed event. The event is a json relayed by the raspi from the camera.
 // The structure is expected to be similar to the AlprPayload, differing only in camid.
 async fn alpr_webhook_handler(
@@ -131,12 +183,28 @@ async fn alpr_webhook_handler(
     _headers: header::HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let (status, text) = process_event(&state, &body).await;
+    // Success bodies are JSON; errors are plain text.
+    let content_type = if status == StatusCode::OK {
+        "application/json"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    (status, [(header::CONTENT_TYPE, content_type)], text)
+}
+
+/// Validates, de-duplicates and stores one event. `body` is the exact bytes the
+/// Pi POSTed: the hash is computed over them *before* any parsing, so it matches
+/// whatever the Pi hashed on its side.
+pub async fn process_event(state: &CollectorState, body: &[u8]) -> EventResponse {
     println!("\n=== Incoming ALPR Trigger from PI ===");
+
+    let hash = content_hash(body);
 
     // ---------------------------
     // 1. Decode the JSON payload.
     // ---------------------------
-    let payload: AlprPayload = match serde_json::from_slice(&body) {
+    let payload: AlprPayload = match serde_json::from_slice(body) {
         Ok(payload) => payload,
         Err(error) => {
             eprintln!("Failed to parse ALPR JSON: {}", error);
@@ -144,6 +212,25 @@ async fn alpr_webhook_handler(
         }
     };
 
+    // The id becomes part of a filename, so accept only a real UUID. This also
+    // rules out path traversal (`../`) and odd characters. It is normalised to
+    // lowercase-hyphenated so that two spellings of one UUID cannot be stored as
+    // two different events.
+    let event_id = match Uuid::parse_str(&payload.event_id) {
+        Ok(uuid) => uuid.hyphenated().to_string(),
+        Err(_) => {
+            eprintln!(
+                "Rejected event: event_id '{}' is not a UUID",
+                payload.event_id
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid event_id: expected a UUID".to_string(),
+            );
+        }
+    };
+
+    println!("Event:  {}", event_id);
     println!("Camera: {}", payload.camid);
     println!("Plate:  {}", payload.plate);
     println!("Date:   {}", payload.date);
@@ -185,16 +272,29 @@ async fn alpr_webhook_handler(
         }
     };
 
-    // --------------------------------------
-    // 4. Generate a unique ID for this event
-    // --------------------------------------
-    let event_id = Uuid::new_v4().to_string();
+    // -----------------------------------------------------------------
+    // 4. Is this a retry of an event that is already stored?
+    // -----------------------------------------------------------------
+    // This is only a shortcut so that a retry does not decode and rewrite the
+    // images. It is NOT what guarantees uniqueness: two retries can both pass
+    // this check at the same moment, so the insert below is the real arbiter.
+    match find_event(&state.db_conn, &event_id).await {
+        Ok(Some(existing)) => return resolve_existing(&event_id, &hash, existing),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Failed to look up event '{}': {}", event_id, error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while looking up event".to_string(),
+            );
+        }
+    }
 
     // ----------------------------------------------
     // 5. Decode and save the event images into files.
     // ----------------------------------------------
     let (image_filename, plate_filename) = match decode_and_save_images_to_files(
-        &state,
+        state,
         &event_id,
         &payload.image,
         &payload.plate_image,
@@ -213,26 +313,108 @@ async fn alpr_webhook_handler(
     // 6. Insert the event using SeaORM
     // ------------------------------------
     let new_event = alpr_events::ActiveModel {
-        id: Set(event_id),
+        id: Set(event_id.clone()),
         camera_id: Set(camera.id),
         date: Set(event_date),
         plate: Set(payload.plate),
         image: Set(image_filename.clone()),
         plate_image: Set(plate_filename.clone()),
+        content_hash: Set(Some(hash.clone())),
     };
 
-    if let Err(error) = new_event.insert(&state.db_conn).await {
-        eprintln!("Failed to insert alpr event: {}", error);
-        // Don't leave orphaned image files behind.
-        let _ = std::fs::remove_file(state.images_dir.join(&image_filename));
-        let _ = std::fs::remove_file(state.images_dir.join(&plate_filename));
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to save event".to_string(),
-        );
-    }
+    match new_event.insert(&state.db_conn).await {
+        Ok(_) => ack_response(event_id, hash, false),
+        Err(error) => {
+            // A unique violation means another request stored this event (or
+            // these exact bytes) between our check in step 4 and this insert.
+            // Work out which by reading the stored row, not by parsing the
+            // error text. The image files are NOT removed in that case: they
+            // have the same names as, and belong to, the already-stored event.
+            if matches!(
+                error.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            ) {
+                return resolve_conflict(&state.db_conn, &event_id, &hash).await;
+            }
 
-    (StatusCode::OK, "OK".to_string())
+            eprintln!("Failed to insert alpr event: {}", error);
+            // Don't leave orphaned image files behind.
+            let _ = std::fs::remove_file(state.images_dir.join(&image_filename));
+            let _ = std::fs::remove_file(state.images_dir.join(&plate_filename));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to save event".to_string(),
+            )
+        }
+    }
+}
+
+/// Looks up an already-stored event by its Pi-supplied id.
+async fn find_event(
+    db: &DatabaseConnection,
+    event_id: &str,
+) -> Result<Option<alpr_events::Model>, sea_orm::DbErr> {
+    alpr_events::Entity::find_by_id(event_id.to_string())
+        .one(db)
+        .await
+}
+
+/// Decides the response when `event_id` is already stored.
+///
+/// * same hash      => a retry of the same bytes: success, `duplicate: true`, so
+///   the Pi can stop retrying. (A retry must succeed, not fail: the original
+///   response may simply have been lost on the way back.)
+/// * different hash => the Pi reused an id for different data. Reporting success
+///   would make it discard the new data, so this is a `409`.
+/// * stored hash is NULL => the row predates the protocol; its content cannot be
+///   compared, so it is also a `409`.
+fn resolve_existing(event_id: &str, hash: &str, existing: alpr_events::Model) -> EventResponse {
+    if existing.content_hash.as_deref() == Some(hash) {
+        println!("Duplicate of stored event {}", event_id);
+        ack_response(event_id.to_string(), hash.to_string(), true)
+    } else {
+        eprintln!(
+            "Rejected event: id {} is already stored with different content",
+            event_id
+        );
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "event_id {} already exists with different content",
+                event_id
+            ),
+        )
+    }
+}
+
+/// Called after an insert hit a unique constraint. Re-reads the winner and
+/// answers as `resolve_existing` would.
+///
+/// If no row has this `event_id`, the clash was on `content_hash` alone. The
+/// `event_id` is inside the hashed body, so that should be unreachable in
+/// practice; it is handled defensively rather than turned into a `500`.
+async fn resolve_conflict(db: &DatabaseConnection, event_id: &str, hash: &str) -> EventResponse {
+    match find_event(db, event_id).await {
+        Ok(Some(existing)) => resolve_existing(event_id, hash, existing),
+        Ok(None) => {
+            // The id is free, so the clash was on content_hash alone.
+            eprintln!(
+                "Rejected event: content of {} is already stored under another event_id",
+                event_id
+            );
+            (
+                StatusCode::CONFLICT,
+                "Identical content already exists under a different event_id".to_string(),
+            )
+        }
+        Err(error) => {
+            eprintln!("Failed to resolve conflict for '{}': {}", event_id, error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while resolving conflict".to_string(),
+            )
+        }
+    }
 }
 
 fn decode_and_save_images_to_files(
