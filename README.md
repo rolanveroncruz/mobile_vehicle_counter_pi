@@ -12,7 +12,7 @@ We separate this into two servers so that we can keep revising the server for th
 
 
 ## Two Servers
-This project creates two binaries (in `src/bin/`), both thin wrappers around a `run_server()` in the library crate:
+This project creates two server binaries (in `src/bin/`), both thin wrappers around a `run_server()` in the library crate:
 
 | Binary           | Calls                          | Default address                  | Purpose                                                         |
 |------------------|--------------------------------|----------------------------------|-----------------------------------------------------------------|
@@ -50,15 +50,27 @@ The handler deliberately validates cheaply first and does expensive work last, a
 | 2    | `date` not RFC 3339              | `400` |
 | 3    | `camid` not in the `camera` table | `422` (**unknown cameras are rejected**; cameras must be registered first) |
 | 3    | DB error looking up camera       | `500` |
+| 4    | (Generate the event UUID; cannot fail) | |
 | 5    | Base64 decode / disk write fails | `500` (a half-written scene image is deleted) |
 | 6    | DB insert fails                  | `500` (both image files are deleted) |
+| done | Event stored                     | **`200`** with the plain-text body `OK` (not `201`) |
+
+Every collector response has a **plain-text body** (e.g. `Invalid JSON payload`, `Unknown camera 'X'`, `OK`), not JSON. A `GET` on the route returns `405`, and any other path returns `404`.
 
 - `camid` is matched against `camera.id` in exactly one place, `find_camera()`. If the device-reported id ever stops being the camera primary key, change only that function.
 - Files are written **before** the DB insert, and removed if the insert fails, so a failure should not leave orphaned images. A crash between the two steps still could.
 
 ### Dates and time zones
-- `alpr_events.date` is `timestamp_with_time_zone`. The offset sent by the Pi is preserved (`DateTime<FixedOffset>`), not normalised to UTC.
-- The API accepts/returns RFC 3339 with offsets and compares via `chrono`, so mixed offsets compare correctly. Be aware SQLite has no native tz type, so ordering/range filters in SQL operate on the stored text; keep all writers using the same RFC 3339 format.
+- `alpr_events.date` is `timestamp_with_time_zone`, but SQLite has no time zone type: the value is stored as **RFC 3339 text**, and the range filter (`start <= date < end`) and the ordering in `/api/time_limits` are done by the database **comparing that text character by character**. That only matches time order when every stored value and every query bound uses the **same offset**.
+- **Everything is normalised to `+08:00` (Philippine time, no DST).** The whole system runs in one time zone, so this is deliberate and lives in one place, `src/time.rs`:
+  - The **collector** converts the Pi's `date` to `+08:00` before saving, whatever offset the Pi sent (`Z`, `-05:00`, ...). The instant is unchanged; only the offset used to write it down changes. The Pi's original offset is **not** kept.
+  - The **API** converts `start_datetime` / `end_datetime` to `+08:00` for the SQL filter in `/api/binned_events` and `/api/bin_events_details`. The frontend may send any offset (e.g. UTC from `toISOString()`).
+  - Bins and the `start_time` / `end_time` of `/api/binned_events` are returned in the offset the frontend asked for.
+  - Verified: with events sent as `+08:00`, `Z` and `-05:00`, the same window written as `17:00+08:00`-`18:00+08:00` and as `09:00Z`-`10:00Z` returns identical events, and UTC-hour and `+08:00`-hour bins give identical counts.
+- **Sub-second digits are not fixed-width** (SeaORM writes none for a whole second, otherwise three, e.g. `...:25+08:00` and `...:25.443+08:00`). That is fine: with one offset, text order still equals time order (tested), so no custom column type is needed. The collector keeps millisecond precision (anything finer is dropped when the value is written).
+- **Rows that bypass the collector must also be `+08:00`.** `migrate_data` copies legacy dates as-is (the legacy file was checked: all rows are `...+08:00`), and rows inserted by hand into SQLite are not normalised. A row stored with another offset would be mis-ordered and mis-filtered again.
+- `/api/time_limits` returns the stored value, so it is returned as `+08:00`.
+- If the deployment ever spans more than one time zone, revisit this properly (see [`TODO.md`](TODO.md)).
 - Time ranges are **half-open**: `start <= date < end`.
 
 ### Binned events (`/api/binned_events`)
@@ -79,7 +91,7 @@ The handler deliberately validates cheaply first and does expensive work last, a
 
 - Because of the above, deleting a **location** that contains a sublocation with cameras will fail (the cascade hits the `camera` RESTRICT). Events are effectively permanent.
 - `camera.orientation` has a CHECK constraint: only `Inbound` or `Outbound`.
-- There is **no API to create cameras**. Cameras are inserted by hand / by the legacy migration, and the collector rejects events from unregistered cameras.
+- There is **no API to create cameras**. Cameras are inserted by hand (directly in SQLite, e.g. `INSERT INTO camera(id, name, description, sublocation_id, orientation) VALUES (...)`, after creating the `location` and `sublocation` rows) or by the legacy `migrate_data` tool, and the collector rejects events from unregistered cameras. `camera.id` must equal the `camid` that the Pi sends.
 - `location.description` is required (`NOT NULL`); `sublocation.description` is optional.
 - SQLite foreign keys are enforced by sqlx by default; do not disable them.
 - The entities in `src/entities/` are `sea-orm-codegen` output ("@generated"). Prefer regenerating from the DB over hand-editing.
@@ -88,6 +100,8 @@ The handler deliberately validates cheaply first and does expensive work last, a
 - `POST /api/login` is public; **every other API route is behind `auth_middleware`** (JWT Bearer, HS256, secret from `JWT_SECRET`). `route_layer` is used so unmatched paths still 404 rather than 401.
 - Tokens expire in **24 hours** (`expires_in: 86400`). There is no refresh token and no revocation; `is_active = false` only blocks *new* logins, not already-issued tokens.
 - Passwords are hashed with **Argon2** (PHC string in `users.encrypted_password`). Login returns `401` for unknown user, inactive user, bad hash and wrong password alike (no user enumeration).
+- **The `users` table is a placeholder.** It exists so the frontend has a login to show and so earlier code could be reused. **Who the users will be, and how roles and permissions work, is undecided (TBD).** Today there are no roles: any valid login can call every API route, and there is no API to create or change users.
+- `users.email` has **no UNIQUE constraint**. Duplicate emails are accepted by the database (verified), and login would then pick one of the rows arbitrarily. Nothing in the API creates users, so this only matters if rows are inserted by hand. Add a unique index when the user model is designed.
 - `JWT_SECRET` is read from the environment **on every request**, not at startup. If it is missing, the server starts fine and then returns `500` on every login/authenticated request.
 - **The collector endpoint has no authentication.** It relies on being reachable only through nginx / the network. Consider a shared secret or IP allow-list before exposing it publicly.
 - The first migration seeds a user **`admin@admin` / `asdf`**. Change or remove it in any real deployment. (The integration tests log in with it.)
@@ -96,6 +110,9 @@ The handler deliberately validates cheaply first and does expensive work last, a
 ### API conventions
 - Most "query" endpoints are `POST` with a JSON body (`/api/time_limits`, `/api/binned_events`, `/api/bin_events_details`) because they take lists of sublocation ids.
 - Handlers return bare `StatusCode`s on error (no JSON error body) and log details with `eprintln!`. Success codes: `201` create, `204` delete, `404` when deleting a missing id.
+- **Exception: errors raised by axum itself carry a plain-text body.** A request body that is not valid for the endpoint (a missing field such as `description`, or an unknown `interval` such as `years`) returns **`422`** with axum's message, e.g. ``Failed to deserialize the JSON body ... missing field `description` ``. Handler errors never have a body.
+- **Database constraint failures are `500`, not `4xx`.** This covers deleting a sublocation that has cameras, deleting a location whose sublocations have cameras, **and creating a sublocation with a `location_id` that does not exist** (foreign key violation). The cause is only in the server log.
+- An end time before the start time in `/api/binned_events` is not an error: it returns `200` with `[]`.
 
 
 ## Configuration
@@ -137,7 +154,7 @@ Decisions and reminders:
 - **Backups:** copying only `server.db` can miss committed data still in the `-wal` file. Use `sqlite3 server_db/server.db ".backup backup.db"` (or copy all three files).
 - There is still only **one writer at a time**. If collector write volume ever outgrows that, the next step is a client/server database (e.g. Postgres), not more SQLite tuning.
 - SeaORM defaults a SQLite pool to **one connection** when `max_connections` is not set, and `db::connect` does not change that. Concurrency between the two *processes* comes from WAL; within one process, queries are serialised through that single connection. Raise it in `db::connect` if the API becomes a bottleneck.
-- The integration tests in `tests/` still call `Database::connect` directly (plain rollback-journal behaviour unless the file is already in WAL). That is fine for them, but they do not exercise `db::connect`.
+- The integration tests in `tests/` still call `Database::connect` directly (plain rollback-journal behaviour unless the file is already in WAL). That is fine for them, but they do not exercise `db::connect` (tracked in `TODO.md`).
 
 
 ## The database file and what happens when it is missing
@@ -175,11 +192,15 @@ The old `images/` directory (and `out/`) are **not** touched by this. Leftover i
 - `images/` and `out/` are git-ignored.
 - Open items that were deliberately deferred are in [`TODO.md`](TODO.md).
 
-What actually happens (verified by running the binaries with `DATABASE_URL=...?mode=rw`):
+### What actually happens
+
+Verified by running the binaries with `DATABASE_URL=...?mode=rw`:
 
 | Situation | Result |
 |-----------|--------|
-| Collector, **file and/or directory missing** | Creates directory + file, migrates, starts normally. |
+| Collector, **file and/or directory missing** | Creates directory + file, migrates, starts normally, and logs the `NEW, EMPTY database` warning. |
+| Collector, file missing but **`-wal` / `-shm` left over** | **Exits immediately** with an error naming the leftover files. Delete them and restart. |
+| Collector, existing database | Starts normally, applies any pending migrations, no warning. |
 | API, **file missing** | **Exits immediately** with `unable to open database file` (code 14). |
 | API, `mode=rwc` in the URL, file missing | **Still exits** with `unable to open database file`: the API always passes `create_if_missing(false)`, which overrides the URL. (Verified.) |
 | Variable missing | Both servers **panic** at startup (`DATABASE_URL must be set in .env file`). |
@@ -212,11 +233,13 @@ The migration CLI needs `mode=rwc` to create the file. (See `migration/README.md
 
 
 ## Testing
-- `tests/location_test.rs` and `tests/sublocations_test.rs` are **integration tests that run against the real database in `DATABASE_URL`** (not a temp/in-memory DB), log in as `admin@admin`/`asdf`, create rows, and delete them. They therefore need a migrated database and `JWT_SECRET`, and will leave rows behind if a test fails midway. Don't point them at production data.
+- `cargo test --lib` runs the unit tests in `src/db.rs` (URL parsing and the leftover-file check). They need no database or `.env`.
+- `tests/location_test.rs` and `tests/sublocations_test.rs` are **integration tests that run against the real database in `DATABASE_URL`** (not a temp/in-memory DB), log in as `admin@admin`/`asdf`, create rows, and delete them. They therefore need a migrated database (so start the collector once after a reset) and `JWT_SECRET`, and will leave rows behind if a test fails midway. Don't point them at production data.
 - There are **no tests for the collector** (`collector_server.rs`) or for the events endpoints.
 - `http_tests/login.http` is a manual request file for the IDE HTTP client (API on port 3000).
 
 
 ## Repository notes
-- `.gitignore` excludes `target/`, `.idea/`, `images/`, `out/` and `migration/target`. **`.env` is not ignored and is currently tracked in git**, so `JWT_SECRET` is committed. `server_db/server.db` is not tracked today, but it is not ignored either, so it could be added by accident (it contains the seeded admin user's hash). Consider ignoring both and committing a `.env.example` instead; rotate `JWT_SECRET` if this repo is ever shared.
+- `.gitignore` excludes `target/`, `.idea/`, `images/`, `out/`, `migration/target` and `server_db/`. **`.env` is not ignored and is currently tracked in git**, so `JWT_SECRET` is committed (see `TODO.md`). Consider ignoring it and committing a `.env.example` instead; rotate `JWT_SECRET` if this repo is ever shared.
+- `server_db/server.db` was committed in earlier commits, so it is still present in **git history** (including the seeded admin user's hash), even though it is no longer tracked.
 - `out/` holds the legacy database (`alpr_events.db`) and legacy images, used only by `migrate_data`.

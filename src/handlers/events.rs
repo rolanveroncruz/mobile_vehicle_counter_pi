@@ -1,13 +1,12 @@
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Timelike};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder };
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
 
 // Assuming these are imported from your entity modules
 use crate::entities::{alpr_events, camera};
 use crate::handlers::app_state::AppState;
-
-
+use crate::time::to_storage_offset;
 
 // region: Get_time_limits
 #[derive(Deserialize, Debug)]
@@ -26,7 +25,6 @@ pub async fn get_time_limits(
     State(state): State<AppState>,
     Json(payload): Json<TimeLimitsRequest>,
 ) -> Result<Json<TimeLimitsResponse>, axum::http::StatusCode> {
-
     // Fetch the earliest event
     let earliest_event = alpr_events::Entity::find()
         .inner_join(camera::Entity)
@@ -92,14 +90,15 @@ pub async fn get_binned_events(
     State(state): State<AppState>,
     Json(payload): Json<EventBinRequest>,
 ) -> Result<Json<Vec<BinResponse>>, axum::http::StatusCode> {
-
     // 1. Fetch all events within the overall time range for the specified sublocations
     // We join the camera to filter by sublocation_id.
     let events = alpr_events::Entity::find()
         .inner_join(camera::Entity)
         .filter(camera::Column::SublocationId.is_in(payload.sublocation_ids))
-        .filter(alpr_events::Column::Date.gte(payload.start_datetime))
-        .filter(alpr_events::Column::Date.lt(payload.end_datetime))
+        // SQLite compares the stored date as text, so the bounds must use the
+        // same offset as the stored values. See `time.rs`.
+        .filter(alpr_events::Column::Date.gte(to_storage_offset(payload.start_datetime)))
+        .filter(alpr_events::Column::Date.lt(to_storage_offset(payload.end_datetime)))
         .all(&state.db_conn)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -131,9 +130,10 @@ pub async fn get_binned_events(
     // Since dates are stored with timezones (e.g., +08:00), chrono handles the comparisons properly.
     for event in events {
         // Find the bin where: bin.start_time <= event.date < bin.end_time
-        if let Some(bin) = bins.iter_mut().find(|b| {
-            event.date >= b.start_time && event.date < b.end_time
-        }) {
+        if let Some(bin) = bins
+            .iter_mut()
+            .find(|b| event.date >= b.start_time && event.date < b.end_time)
+        {
             bin.count += 1;
         }
     }
@@ -169,7 +169,7 @@ fn advance_time(current: &DateTime<FixedOffset>, interval: &BinInterval) -> Date
                     day,
                     current.hour(),
                     current.minute(),
-                    current.second()
+                    current.second(),
                 ) {
                     // Re-apply the exact nanoseconds for millisecond precision matching
                     return dt.with_nanosecond(current.nanosecond()).unwrap_or(dt);
@@ -196,12 +196,12 @@ pub async fn get_bin_event_details(
     State(state): State<AppState>,
     Json(payload): Json<EventDetailsRequest>,
 ) -> Result<Json<Vec<alpr_events::Model>>, axum::http::StatusCode> {
-
     let events = alpr_events::Entity::find()
         .inner_join(camera::Entity)
         .filter(camera::Column::SublocationId.is_in(payload.sublocation_ids))
-        .filter(alpr_events::Column::Date.gte(payload.start_datetime))
-        .filter(alpr_events::Column::Date.lt(payload.end_datetime))
+        // Bounds use the storage offset; see `time.rs`.
+        .filter(alpr_events::Column::Date.gte(to_storage_offset(payload.start_datetime)))
+        .filter(alpr_events::Column::Date.lt(to_storage_offset(payload.end_datetime)))
         .order_by_desc(alpr_events::Column::Date) // Optional: returns newest events first
         .all(&state.db_conn)
         .await
@@ -210,8 +210,7 @@ pub async fn get_bin_event_details(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        Ok(Json(events))
+    Ok(Json(events))
 }
-
 
 // endregion: Get_binned_events

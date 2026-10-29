@@ -1,7 +1,7 @@
 /*
  * This file contains 4 functions related to accepting POST-ed data from raspberry pi deployments.
  * 1. run_server() - this reads environment files to configure the database url and the address of the server.
- * 2. build_collector_server() - returns a Router which responds only to '/api/alpr/events'
+ * 2. build_collector_server() - returns a Router which responds only to '/api/alpr/event'
  * using the handler alpr_webhook_handler().
  * 3. aplr_webhook_handler()-
  * 4. decode_and_save_images_to_files()-
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::entities::{alpr_events, camera};
+use crate::time;
 
 /// State for the data collector server.
 ///
@@ -141,8 +142,10 @@ async fn alpr_webhook_handler(
     // ---------------------------
     // 2. Parse the event date.
     // ---------------------------
+    // The date is stored in one fixed offset (+08:00) so that SQLite's text
+    // comparison orders events by time. See `time.rs`.
     let event_date = match DateTime::parse_from_rfc3339(&payload.date) {
-        Ok(date) => date,
+        Ok(date) => time::to_storage_offset(date),
         Err(error) => {
             eprintln!("Failed to parse date '{}': {}", payload.date, error);
             return (

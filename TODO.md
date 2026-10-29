@@ -17,6 +17,32 @@ Known items that were deliberately deferred. Nothing here is blocking.
 - [ ] **The collector endpoint (`POST /api/alpr/event`) has no authentication.**
       See "Authentication" in the README.
 
+## Correctness
+
+- [ ] **Single time zone assumption (`+08:00`).** Event dates are stored as text and
+      compared as text by SQLite, so they are all normalised to `+08:00` (`src/time.rs`),
+      by the collector when saving and by the API for query bounds. This is correct only
+      while the whole system is in one time zone (Philippines). If cameras or users ever span
+      several zones, review this properly: either store UTC plus a separate zone, or filter
+      by instant instead of by text. Existing rows would then need a one-off conversion.
+- [ ] **Dates written outside the collector are not normalised.** `migrate_data` and
+      hand-inserted rows go straight to SQLite. They must already be `+08:00`, or they will be
+      mis-ordered and mis-filtered. Consider a CHECK constraint or a startup sanity check that
+      reports any `alpr_events.date` not ending in `+08:00`.
+- [ ] **Integration test for the time zone behaviour.** The unit tests in `src/time.rs` cover
+      the conversion, and it was verified by hand against the running servers, but there is no
+      automated end-to-end test (POST events with `+08:00` / `Z` / `-05:00`, then query in
+      several offsets). It needs a collector test harness, which does not exist yet.
+
+## Users and permissions
+
+- [ ] **The user model is TBD.** The `users` table is a placeholder for the frontend login.
+      Who the users are, roles and permissions are undecided. Today any valid login can
+      call every route. When this is designed: add a UNIQUE index on `users.email`
+      (duplicates are currently accepted), and decide how users are created and deactivated.
+      Also note that tokens already issued keep working after `is_active` is set to false,
+      for up to 24 hours.
+
 ## Testing
 
 - [ ] **Integration tests bypass `db::connect`.** `tests/location_test.rs` and
@@ -27,6 +53,12 @@ Known items that were deliberately deferred. Nothing here is blocking.
       through `db::connect(.., MissingDatabase::CreateAndMigrate)`.
 
 ## Operations
+
+- [ ] **No graceful shutdown.** Both servers call `axum::serve(listener, app)` without
+      `with_graceful_shutdown`, so a `SIGTERM` (e.g. `systemctl restart`) ends the process
+      immediately and can cut an in-flight request, such as a collector event between writing
+      the images and inserting the row. Add a shutdown signal handler that lets in-flight
+      requests finish, especially for the collector.
 
 - [ ] **Concurrent collectors are unsupported.** Only one collector may run; two started at
       once against a missing database can race in `Migrator::up`
