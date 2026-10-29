@@ -1,6 +1,6 @@
 //! Shared database connection setup for both servers.
 //!
-//! `data_collector` and `frontend_api` are separate processes that share one
+//! `run_data_collector` and `run_frontend_api` are separate processes that share one
 //! SQLite file. They must open it with identical settings, so the setup lives
 //! here instead of being duplicated in each `run_server()`.
 
@@ -47,10 +47,12 @@ pub enum MissingDatabase {
 /// These are applied as PRAGMAs, **not** as URL query parameters: sqlx rejects
 /// unknown parameters such as `journal_mode` and refuses to start.
 ///
-/// `on_missing` decides what happens when the database file does not exist:
+/// `on_missing` decides what happens when the database file does not exist
+/// (with `CreateAndMigrate`, leftover `-wal`/`-shm` files next to a missing
+/// database are an error, and creating a new database is logged loudly):
 ///
-/// * [`MissingDatabase::Fail`]: the connection is opened exactly as the URL
-///   says (`mode=rw` fails fast on a missing file).
+/// * [`MissingDatabase::Fail`]: a missing file is always an error, even if the
+///   URL says `mode=rwc` (`create_if_missing(false)` overrides the URL).
 /// * [`MissingDatabase::CreateAndMigrate`]: the parent directory is created,
 ///   the file is created (`create_if_missing`, overriding `mode=rw` from the
 ///   URL), and `Migrator::up` is run. Migrations only apply when something is
@@ -61,8 +63,16 @@ pub async fn connect(
     on_missing: MissingDatabase,
 ) -> Result<DatabaseConnection, DbErr> {
     let create = on_missing == MissingDatabase::CreateAndMigrate;
+    let mut created_path: Option<PathBuf> = None;
 
     if create {
+        if let Some(path) = sqlite_file_path(db_url) {
+            // Refuse to build a new database on top of leftover WAL files.
+            check_no_leftover_files(&path)?;
+            if !path.exists() {
+                created_path = Some(path);
+            }
+        }
         create_parent_dir(db_url)?;
     }
 
@@ -82,7 +92,59 @@ pub async fn connect(
         Migrator::up(&db_conn, None).await?;
     }
 
+    if let Some(path) = created_path {
+        let shown = std::path::absolute(&path).unwrap_or(path);
+        eprintln!("============================================================");
+        eprintln!("WARNING: database file not found. A NEW, EMPTY database was");
+        eprintln!("created and migrated at: {}", shown.display());
+        eprintln!("It contains the seeded admin user and no locations/cameras.");
+        eprintln!("If this was not intended, check DATABASE_URL.");
+        eprintln!("============================================================");
+    }
+
     Ok(db_conn)
+}
+
+/// The SQLite side files that sit next to a WAL-mode database.
+const SIDE_FILE_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
+
+/// Returns the `-wal` / `-shm` files that exist next to `db_path`, but only when
+/// the database file itself is missing. Side files next to an existing database
+/// are normal (WAL mode) and are not reported.
+fn leftover_side_files(db_path: &std::path::Path) -> Vec<PathBuf> {
+    if db_path.exists() {
+        return Vec::new();
+    }
+    SIDE_FILE_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let mut name = db_path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        })
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Fails if the database file is missing but its WAL side files are not.
+///
+/// A stale `-wal` file next to a freshly created database can be replayed into
+/// it or confuse SQLite, so the operator must delete them and restart.
+fn check_no_leftover_files(db_path: &std::path::Path) -> Result<(), DbErr> {
+    let leftovers = leftover_side_files(db_path);
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    let list = leftovers
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(DbErr::Custom(format!(
+        "database file {} is missing, but leftover SQLite files exist: {list}. \
+         Delete the leftover file(s) and restart the collector.",
+        db_path.display()
+    )))
 }
 
 /// Creates the directory that will contain the database file, since SQLite
@@ -157,5 +219,45 @@ mod tests {
     #[test]
     fn ignores_non_sqlite() {
         assert_eq!(sqlite_file_path("postgres://localhost/db"), None);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("db_unit_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn no_leftovers_when_nothing_exists() {
+        let dir = scratch_dir("none");
+        assert!(check_no_leftover_files(&dir.join("s.db")).is_ok());
+    }
+
+    #[test]
+    fn leftover_wal_without_db_is_an_error() {
+        let dir = scratch_dir("wal");
+        std::fs::write(dir.join("s.db-wal"), b"x").unwrap();
+        let err = check_no_leftover_files(&dir.join("s.db"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("s.db-wal"), "{err}");
+        assert!(err.contains("Delete"), "{err}");
+    }
+
+    #[test]
+    fn leftover_shm_without_db_is_an_error() {
+        let dir = scratch_dir("shm");
+        std::fs::write(dir.join("s.db-shm"), b"x").unwrap();
+        assert!(check_no_leftover_files(&dir.join("s.db")).is_err());
+    }
+
+    #[test]
+    fn side_files_next_to_existing_db_are_fine() {
+        let dir = scratch_dir("ok");
+        std::fs::write(dir.join("s.db"), b"x").unwrap();
+        std::fs::write(dir.join("s.db-wal"), b"x").unwrap();
+        std::fs::write(dir.join("s.db-shm"), b"x").unwrap();
+        assert!(check_no_leftover_files(&dir.join("s.db")).is_ok());
     }
 }

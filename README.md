@@ -16,10 +16,12 @@ This project creates two binaries (in `src/bin/`), both thin wrappers around a `
 
 | Binary           | Calls                          | Default address                  | Purpose                                                         |
 |------------------|--------------------------------|----------------------------------|-----------------------------------------------------------------|
-| `data_collector` | `collector_server::run_server()` | `127.0.0.1:3001` (`COLLECTOR_ADDR`) | Receives POSTED base64 events, saves images to disk, inserts rows. |
-| `frontend_api`   | `api_server::run_server()`       | `127.0.0.1:3000` (hard-coded)       | Backend for the angular frontend (login, locations, event stats). |
+| `run_data_collector` | `collector_server::run_server()` | `127.0.0.1:3001` (`COLLECTOR_ADDR`) | Receives POSTED base64 events, saves images to disk, inserts rows. **Creates and migrates the database if it is missing.** |
+| `run_frontend_api`   | `api_server::run_server()`       | `127.0.0.1:3000` (`API_ADDR`)       | Backend for the angular frontend (login, locations, event stats). **Fails at startup if the database is missing.** |
 
-`default-run` in `Cargo.toml` is `frontend_api`, so a bare `cargo run` starts the **API**, not the collector. Use `cargo run --bin data_collector` for the collector.
+`default-run` in `Cargo.toml` is `run_frontend_api`, so a bare `cargo run` starts the **API**, not the collector. Use `cargo run --bin run_data_collector` for the collector.
+
+Throughout this document, "the collector" means `run_data_collector` and "the API" means `run_frontend_api`.
 
 There is also `migrate_data` (`cargo run --bin migrate_data`), a **one-off** tool that copies legacy data from `out/alpr_events.db` into `server_db/server.db`. It hard-codes both paths relative to the current directory and seeds a legacy test location (`TCEV`), sublocation (`Balimbing`) and two cameras. It is not part of normal operation.
 
@@ -103,15 +105,16 @@ Loaded with `dotenvy` from `.env` in the **current working directory**.
 | Variable        | Used by          | Notes |
 |-----------------|------------------|-------|
 | `DATABASE_URL`  | both servers, tests | **Required** (the process panics at startup if absent). Use `sqlite://server_db/server.db?mode=rw`. Relative paths resolve against the cwd. |
-| `JWT_SECRET`    | `frontend_api`, tests | Required at request time (see Authentication). |
-| `COLLECTOR_ADDR`| `data_collector` | Default `127.0.0.1:3001`. |
-| `IMAGE_DIR`     | `data_collector` | Default `images`. Created automatically if missing. |
+| `JWT_SECRET`    | the API, tests | Required at request time (see Authentication). |
+| `API_ADDR`      | the API | Listen address. Default `127.0.0.1:3000`. Keep it on `127.0.0.1` (the API is meant to sit behind nginx), and update the nginx `proxy_pass` if you change the port. |
+| `COLLECTOR_ADDR`| the collector | Default `127.0.0.1:3001`. |
+| `IMAGE_DIR`     | the collector | Default `images`. Created automatically if missing. |
 
 Gotchas:
 - The images directory variable is **`IMAGE_DIR`** (`.env` used to say `IMAGES`, which the code never read).
 - **`dotenvy` does not override variables already set in the shell.** A stale `DATABASE_URL` exported in your shell (e.g. from another project) silently wins over `.env`. If the server complains about an unrelated database driver, run `unset DATABASE_URL`.
 - **Do not put `journal_mode=WAL` (or any other pragma) in `DATABASE_URL`.** sqlx 0.9's SQLite URL parser only accepts `mode`, `cache`, `immutable` and `vfs`; any other parameter is a hard error (`unknown query parameter 'journal_mode'`) and the server refuses to start. SQLite pragmas are set in code instead, see "SQLite connection settings" below.
-- `DATABASE_URL` should use `mode=rw`. File creation is opt-in in code (`MissingDatabase::CreateAndMigrate`), used only by `data_collector`; the API fails fast on a missing file.
+- `DATABASE_URL` should use `mode=rw`. File creation is opt-in in code (`MissingDatabase::CreateAndMigrate`), used only by the collector; the API fails fast on a missing file.
 - Everything is relative to the working directory (`.env`, `server_db/`, `images/`). Run both servers from the project root (or use absolute paths / systemd `WorkingDirectory`).
 
 
@@ -143,28 +146,52 @@ The schema is owned by the `migration/` crate (SeaORM migrations). Whether a mis
 
 | Server | `MissingDatabase` | Missing file |
 |--------|-------------------|--------------|
-| `data_collector` | `CreateAndMigrate` | Creates the parent directory and the file, then runs all pending migrations (`Migrator::up`). Also applies pending migrations to an existing/empty file. |
-| `frontend_api` | `Fail` | Exits immediately with `unable to open database file`. It never creates or migrates. |
+| `run_data_collector` | `CreateAndMigrate` | Creates the parent directory and the file, then runs all pending migrations (`Migrator::up`). Also applies pending migrations to an existing/empty file. |
+| `run_frontend_api` | `Fail` | Exits immediately with `unable to open database file`. It never creates or migrates. |
 
-The collector overrides the URL's `mode=rw` with `create_if_missing(true)`, so `.env` keeps `mode=rw` for everyone. Start the `data_collector` first on a fresh deployment; the API then finds a ready database. Auto-created databases contain the seeded `admin@admin` user from the migrations.
+The collector overrides the URL's `mode=rw` with `create_if_missing(true)`, so `.env` keeps `mode=rw` for everyone. Start the collector first on a fresh deployment; the API then finds a ready database. Auto-created databases contain the seeded `admin@admin` user from the migrations.
+
+### Why the collector creates the database: the "reset after testing" workflow
+
+This is deliberate. Both servers run as long-lived services, and **exactly one collector instance runs at a time**. The collector is allowed to create the database so that, after a testing phase, you can wipe the test data and go live without running any migration command by hand:
+
+1. Stop both services (the collector and the API).
+2. Delete the database **and its WAL side files**: `rm -f server_db/server.db server_db/server.db-wal server_db/server.db-shm`. (If you forget the side files, the collector will refuse to start and tell you to delete them.)
+3. Start the collector. It recreates the directory/file, migrates, and seeds `admin@admin`.
+4. Start the API.
+5. Re-create the `location` -> `sublocation` -> `camera` chain (there is no API to create cameras, and the collector rejects events from unregistered cameras with `422`).
+6. Change or remove the seeded `admin@admin` / `asdf` user.
+
+**Leftover files make the collector refuse to start.** If the database file is missing but `server.db-wal` or `server.db-shm` still exist, the collector exits with an error naming the files and telling you to delete them and restart. A stale `-wal` next to a brand-new database can be replayed into it or confuse SQLite, so this is checked *before* anything is created. (Side files next to an existing database are normal and are not reported.)
+
+**Creating a new database is logged loudly.** When the collector creates the file, it prints a `WARNING: database file not found. A NEW, EMPTY database was created and migrated at: <absolute path>` banner to stderr, so it is easy to spot in the service logs (e.g. `journalctl`). It is **not** printed on a normal restart. If you see it unexpectedly, `DATABASE_URL` probably points at the wrong path.
+
+Because only one collector ever runs, there is no locking around the create-and-migrate step. Starting two collectors at once against a missing database can make one of them fail with `UNIQUE constraint failed: seaql_migrations.version`. That is not a supported setup.
+
+The old `images/` directory (and `out/`) are **not** touched by this. Leftover images are orphaned (the DB no longer references them) but harmless, so clearing them is optional. Both directories are git-ignored on purpose.
+
+### What is (and is not) in git
+- `server_db/` is **git-ignored**. The database is created at runtime by the collector, never committed. (It used to be tracked; it was removed from the index with `git rm --cached`. If you pull an old checkout that still tracks it, your local file is not deleted by that, but a checkout of an old commit can overwrite it, so back it up first.)
+- `images/` and `out/` are git-ignored.
+- Open items that were deliberately deferred are in [`TODO.md`](TODO.md).
 
 What actually happens (verified by running the binaries with `DATABASE_URL=...?mode=rw`):
 
 | Situation | Result |
 |-----------|--------|
-| `data_collector`, **file and/or directory missing** | Creates directory + file, migrates, starts normally. |
-| `frontend_api`, **file missing** | **Exits immediately** with `unable to open database file` (code 14). |
-| `mode=rwc` in the URL, `frontend_api`, file missing | Would create an **empty 0-byte** file (the URL's `rwc` is honored when `Fail` is used), then fail with `500 no such table`. Don't use `rwc` in `.env`. |
+| Collector, **file and/or directory missing** | Creates directory + file, migrates, starts normally. |
+| API, **file missing** | **Exits immediately** with `unable to open database file` (code 14). |
+| API, `mode=rwc` in the URL, file missing | **Still exits** with `unable to open database file`: the API always passes `create_if_missing(false)`, which overrides the URL. (Verified.) |
 | Variable missing | Both servers **panic** at startup (`DATABASE_URL must be set in .env file`). |
 | File deleted **while running** | Processes **stay alive**; requests return `500`. (On Linux the open handle keeps the old inode, so behavior can vary; restart after restoring.) |
 | Tables missing (empty/unmigrated DB) | Processes **stay alive**; API returns `500` (`no such table: users`), collector returns `500` (`no such table: camera`). **Events from the Pis are rejected** until the DB is migrated. |
 
 Design implications / reminders:
-- The failure is **loud at startup only when the file cannot be opened**. The dangerous case is `mode=rwc` with a missing file: the collector looks healthy but is silently dropping every event with `500`. Monitor for non-2xx from the collector (the Pis should retry/queue on failure).
+- The failure is **loud at startup only when the file cannot be opened**. The remaining silent case is a database that exists but has no tables (e.g. restored from a broken backup): the collector's startup migration normally fixes that, but if a migration fails midway the process exits rather than running half-migrated. Monitor for non-2xx from the collector (the Pis should retry/queue on failure).
 - Per-request DB errors never crash the processes. Handlers map DB errors to `500` and log them.
 - Neither server retries the connection: the connection is opened **once at startup**. If the DB is unavailable at boot, the process exits and must be restarted by a supervisor (systemd `Restart=on-failure`).
 - `.env` uses `mode=rw` so a missing/misplaced database fails fast in the API. Only the collector creates the file, and it does so in code. A typo in `DATABASE_URL` therefore creates a fresh database when starting the collector, so check the path if the collector unexpectedly starts with no data.
-- If both servers start at the same moment against a missing database, only the collector migrates; the API fails fast and can be restarted by its supervisor.
+- If both servers start at the same moment against a missing database, only the collector migrates; the API fails fast and can be restarted by its supervisor (`Restart=on-failure`). Start the collector first, or let the supervisor retry the API.
 - Because the two servers are independent, one being down does not affect the other, but they fail **together** if they share the same missing/broken database file.
 
 ### Creating / migrating the database manually
@@ -175,6 +202,13 @@ cd migration
 DATABASE_URL="sqlite://../server_db/server.db?mode=rwc" cargo run -- up
 ```
 The migration CLI needs `mode=rwc` to create the file. (See `migration/README.md` for the other CLI commands. Note the path is relative to `migration/`, and the shell `DATABASE_URL` caveat above applies. The migration CLI uses its own plain connection, so it does not go through `db::connect`.) The migrations create the tables and seed the `admin@admin` user. After migrating you must still insert at least one `location` -> `sublocation` -> `camera` chain before the collector will accept any event.
+
+
+## Dependencies and `Cargo.lock`
+
+- **`Cargo.lock` stays in git.** This crate builds binaries (the two servers), and for applications the Rust convention is to commit the lockfile so every build uses exactly the same dependency versions. Use `cargo build --locked` for deployment builds so a stale lockfile fails the build instead of being silently updated.
+- `migration/Cargo.lock` is also committed, but it is only used when building the migration CLI from inside `migration/`. The main build ignores it and resolves the `migration` path dependency through the root `Cargo.lock`.
+- **Build-time cost of the `migration` dependency:** the servers now depend on the `migration` crate (so the collector can migrate at startup), which pulls in `sea-orm-migration` and, through it, `sea-orm-cli` and `clap`. These are compiled into both binaries even though the API never migrates. This is accepted for now; if build time or binary size matters, make `sea-orm-migration`'s CLI support optional.
 
 
 ## Testing

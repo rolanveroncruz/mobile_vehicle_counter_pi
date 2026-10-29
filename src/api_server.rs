@@ -70,8 +70,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = build_app(state.clone()).layer(cors).with_state(state);
 
-    println!("Alarm server listening on http://127.0.0.1:3000");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    // The data collector uses COLLECTOR_ADDR (port 3001); the API has its own.
+    let addr = env::var("API_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    println!("Alarm server listening on http://{}", addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     axum::serve(listener, app).await?;
 

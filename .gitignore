@@ -3,3 +3,6 @@
 images/
 out/
 migration/target
+
+# SQLite database and its WAL side files (created by the collector)
+server_db/
