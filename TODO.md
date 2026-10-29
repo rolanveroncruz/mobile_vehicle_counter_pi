@@ -14,8 +14,10 @@ Known items that were deliberately deferred. Nothing here is blocking.
       credentials if the database ever changes to Postgres/MySQL. Remove it or redact it.
 - [ ] **`.env` is committed to git** and contains `JWT_SECRET`. Replace the committed file
       with a `.env.example`, add `.env` to `.gitignore`, and rotate the secret.
-- [ ] **The collector endpoint (`POST /api/alpr/event`) has no authentication.**
-      See "Authentication" in the README.
+- [ ] **The collector endpoint (`POST /api/alpr/event`) has no authentication in the Rust
+      code.** The shared secret is enforced by nginx (`deploy/nginx-collector.conf`), so this is
+      only safe while the collector listens on `127.0.0.1` behind nginx. If it is ever exposed
+      directly, add a token check in the handler. See "Authentication" in the README.
 
 ## Correctness
 

@@ -9,7 +9,7 @@
 use axum::{
     Router,
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{Method, StatusCode, header},
     response::IntoResponse,
     routing::post,
@@ -27,6 +27,13 @@ use uuid::Uuid;
 use crate::db;
 use crate::entities::{alpr_events, camera};
 use crate::time;
+
+/// Largest request body (the whole JSON, i.e. both base64 images) the collector accepts.
+///
+/// axum's default is 2 MB, which rejects (413) anything bigger. Base64 inflates
+/// images by about a third, so 20 MB allows roughly 14 MB of raw JPEG data per
+/// event. Keep nginx's `client_max_body_size` in step with this value.
+const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
 
 /// State for the data collector server.
 ///
@@ -100,7 +107,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
 // build_collector_server returns a Router with only one route.
 pub fn build_collector_server() -> Router<CollectorState> {
-    Router::new().route("/api/alpr/event", post(alpr_webhook_handler))
+    Router::new()
+        .route("/api/alpr/event", post(alpr_webhook_handler))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 /// Finds the camera that an incoming payload's `camid` refers to.

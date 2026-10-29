@@ -1,0 +1,74 @@
+# systemd unit for the data collector (run_data_collector).
+#
+# DRAFT: review every line marked "CHANGE" before using it.
+#
+# Install:
+#   sudo cp deploy/mobile-vehicle-collector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mobile-vehicle-collector
+#
+# Watch it:
+#   systemctl status mobile-vehicle-collector
+#   journalctl -u mobile-vehicle-collector -f
+#
+# Only ONE collector may run at a time (see README: two collectors starting
+# against a missing database can race in the migrator). Do not enable this unit
+# on more than one machine sharing the same database file.
+
+[Unit]
+Description=Mobile Vehicle Counter - data collector (receives POSTs from the Raspberry Pis)
+After=network.target
+# Stop systemd giving up if it crash-loops: allow at most 10 starts per 5 minutes.
+# (These two keys must be in [Unit], not [Service], or systemd ignores them.)
+StartLimitIntervalSec=300
+StartLimitBurst=10
+# If you later run the frontend API too, it should start AFTER the collector on a
+# fresh deployment, because only the collector creates/migrates the database.
+# (The API's own unit can say After=mobile-vehicle-collector.service.)
+
+[Service]
+Type=simple
+
+# CHANGE: the account that runs the service. Create it once with:
+#   sudo useradd --system --home-dir /opt/mobile_vehicle_counter_server --shell /usr/sbin/nologin mvc
+# Do not run it as root.
+User=mvc
+Group=mvc
+
+# CHANGE: the project root on the server. The program reads `.env` and uses
+# relative paths (server_db/, images/) from the *current directory*, so this MUST
+# be the directory that contains `.env`, `server_db/` and `images/`.
+WorkingDirectory=/opt/mobile_vehicle_counter_server
+
+# CHANGE: path to the release binary. Build it with:
+#   cargo build --release --locked --bin run_data_collector
+ExecStart=/opt/mobile_vehicle_counter_server/target/release/run_data_collector
+
+# Settings come from `.env` in WorkingDirectory (DATABASE_URL, IMAGE_DIR,
+# COLLECTOR_ADDR). Anything exported in the environment wins over `.env`, so you
+# can override a single value here instead of editing the file, for example:
+#   Environment=COLLECTOR_ADDR=127.0.0.1:3001
+# Keep COLLECTOR_ADDR on 127.0.0.1: only nginx should be reachable from the internet.
+
+# Restart if it crashes or fails to start (e.g. the database was briefly
+# unavailable at boot: the collector connects once at startup and exits on failure).
+Restart=on-failure
+RestartSec=5
+
+# The collector has no graceful-shutdown handler (see TODO.md), so SIGTERM ends
+# it immediately. A short stop timeout avoids waiting for nothing.
+TimeoutStopSec=10
+
+# --- Hardening (safe defaults; loosen only if something is blocked) ---------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# With ProtectSystem=strict the whole filesystem is read-only for this service
+# except the paths listed here. The collector writes the SQLite database
+# (including the -wal/-shm side files) and the images.
+# CHANGE: these must match DATABASE_URL's directory and IMAGE_DIR in `.env`.
+ReadWritePaths=/opt/mobile_vehicle_counter_server/server_db /opt/mobile_vehicle_counter_server/images
+
+[Install]
+WantedBy=multi-user.target

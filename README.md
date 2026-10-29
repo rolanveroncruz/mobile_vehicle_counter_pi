@@ -38,6 +38,7 @@ There is also `migrate_data` (`cargo run --bin migrate_data`), a **one-off** too
 - The collector listens on `127.0.0.1:3001` (not 3000; 3000 is the API). nginx needs a `proxy_pass` to it.
 - The route is **`POST /api/alpr/event`** (singular `event`).
 - Payload (JSON): `camid`, `date`, `plate`, `plate_image`, `image`. `image` and `plate_image` are base64 (standard alphabet) JPEGs. `date` must be **RFC 3339 with offset**, e.g. `2026-10-09T16:44:25.443+08:00`.
+- The request body is limited to **20 MB** (`MAX_BODY_BYTES` in `src/collector_server.rs`); anything larger gets `413`. axum's own default is only 2 MB, which would reject large scene images (base64 adds about a third). The nginx `client_max_body_size` in `deploy/nginx-collector.conf` must be at least as large.
 - The collector **generates its own event id** (UUID v4); the Pi does not supply one. Retrying a POST therefore creates a **duplicate event** (there is no idempotency key).
 - Images are saved as `event_<uuid>.jpg` and `event_<uuid>_plate.jpg`. Only the **filenames** are stored in the DB, not paths or bytes. The directory is not configured per-row, so the API/frontend must know where the images directory is.
 
@@ -103,7 +104,7 @@ Every collector response has a **plain-text body** (e.g. `Invalid JSON payload`,
 - **The `users` table is a placeholder.** It exists so the frontend has a login to show and so earlier code could be reused. **Who the users will be, and how roles and permissions work, is undecided (TBD).** Today there are no roles: any valid login can call every API route, and there is no API to create or change users.
 - `users.email` has **no UNIQUE constraint**. Duplicate emails are accepted by the database (verified), and login would then pick one of the rows arbitrarily. Nothing in the API creates users, so this only matters if rows are inserted by hand. Add a unique index when the user model is designed.
 - `JWT_SECRET` is read from the environment **on every request**, not at startup. If it is missing, the server starts fine and then returns `500` on every login/authenticated request.
-- **The collector endpoint has no authentication.** It relies on being reachable only through nginx / the network. Consider a shared secret or IP allow-list before exposing it publicly.
+- **The collector endpoint has no authentication in the Rust code.** The shared-secret check is done by nginx instead: `deploy/nginx-collector.conf` requires an `X-Collector-Token` header and answers `401` otherwise, so the collector must only be reachable through nginx (keep `COLLECTOR_ADDR` on `127.0.0.1`). See "Deployment" below.
 - The first migration seeds a user **`admin@admin` / `asdf`**. Change or remove it in any real deployment. (The integration tests log in with it.)
 - CORS is `allow_origin(Any)` on both servers and only allows `GET`/`POST` (note: the API also has `DELETE` routes, which a browser preflight would block cross-origin; this is fine only while the frontend is served same-origin via nginx).
 
@@ -225,6 +226,27 @@ DATABASE_URL="sqlite://../server_db/server.db?mode=rwc" cargo run -- up
 The migration CLI needs `mode=rwc` to create the file. (See `migration/README.md` for the other CLI commands. Note the path is relative to `migration/`, and the shell `DATABASE_URL` caveat above applies. The migration CLI uses its own plain connection, so it does not go through `db::connect`.) The migrations create the tables and seed the `admin@admin` user. After migrating you must still insert at least one `location` -> `sublocation` -> `camera` chain before the collector will accept any event.
 
 
+## Deployment
+
+Draft deployment files for the collector are in `deploy/`. Both are heavily commented; lines marked `CHANGE` need your values (domain name, paths, user).
+
+| File | Purpose |
+|------|---------|
+| `deploy/mobile-vehicle-collector.service` | systemd unit that runs `run_data_collector` as a service (restart on failure, runs as an unprivileged user, read-only filesystem except `server_db/` and `images/`). |
+| `deploy/nginx-collector.conf` | nginx site: TLS, redirect from port 80, the `X-Collector-Token` shared-secret check, a 20 MB body limit, per-IP rate limit, and `proxy_pass` to `127.0.0.1:3001`. Only `POST /api/alpr/event` is proxied; every other path is a `404`. |
+
+The shared secret is **not** in the repo. nginx cannot read environment variables, so the config `include`s `/etc/nginx/collector-token.conf`, which you create on the server (the config's header comment shows the exact contents). The Pi sends the same value in an `X-Collector-Token` header on every POST. Because the secret travels in a header, it is only protected if the connection is HTTPS.
+
+Both files were tested: the unit with `systemd-analyze verify`, and the nginx config by running it in front of the real collector (no/wrong token `401`, correct token `200` and a stored row, `GET` `403`, other paths `404`, body over 20 MB `413`). The nginx config avoids `http2 on;` so it works on nginx older than 1.25.1.
+
+Checklist for a first deployment:
+1. Build: `cargo build --release --locked --bin run_data_collector`.
+2. Create the service user, `.env` (a fresh one, not the committed one), and install the unit.
+3. Start the collector once so it creates and migrates the database, then register the `location` -> `sublocation` -> `camera` rows (the camera `id` must equal the Pi's `camid`).
+4. Create the nginx token file, get a certificate (`certbot`), install the nginx config, and run `nginx -t`.
+5. Test from the Pi (or `curl`) with the `X-Collector-Token` header.
+
+
 ## Dependencies and `Cargo.lock`
 
 - **`Cargo.lock` stays in git.** This crate builds binaries (the two servers), and for applications the Rust convention is to commit the lockfile so every build uses exactly the same dependency versions. Use `cargo build --locked` for deployment builds so a stale lockfile fails the build instead of being silently updated.
@@ -235,7 +257,7 @@ The migration CLI needs `mode=rwc` to create the file. (See `migration/README.md
 ## Testing
 - `cargo test --lib` runs the unit tests in `src/db.rs` (URL parsing and the leftover-file check). They need no database or `.env`.
 - `tests/location_test.rs` and `tests/sublocations_test.rs` are **integration tests that run against the real database in `DATABASE_URL`** (not a temp/in-memory DB), log in as `admin@admin`/`asdf`, create rows, and delete them. They therefore need a migrated database (so start the collector once after a reset) and `JWT_SECRET`, and will leave rows behind if a test fails midway. Don't point them at production data.
-- There are **no tests for the collector** (`collector_server.rs`) or for the events endpoints.
+- There are **no automated tests for the collector** (`collector_server.rs`) or for the events endpoints. The collector, including the body limit, was exercised by hand with `curl` against a temporary database.
 - `http_tests/login.http` is a manual request file for the IDE HTTP client (API on port 3000).
 
 
