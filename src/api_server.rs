@@ -62,7 +62,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Read the DATABASE_URL and connect
     // ------------------------
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env file");
-    let db_conn = db::connect(&db_url).await?;
+    // The API never creates or migrates the database: a missing file is a
+    // startup error. The data collector is responsible for creating it.
+    let db_conn = db::connect(&db_url, db::MissingDatabase::Fail).await?;
 
     let state = AppState { db_conn };
 

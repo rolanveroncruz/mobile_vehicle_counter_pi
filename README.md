@@ -111,13 +111,13 @@ Gotchas:
 - The images directory variable is **`IMAGE_DIR`** (`.env` used to say `IMAGES`, which the code never read).
 - **`dotenvy` does not override variables already set in the shell.** A stale `DATABASE_URL` exported in your shell (e.g. from another project) silently wins over `.env`. If the server complains about an unrelated database driver, run `unset DATABASE_URL`.
 - **Do not put `journal_mode=WAL` (or any other pragma) in `DATABASE_URL`.** sqlx 0.9's SQLite URL parser only accepts `mode`, `cache`, `immutable` and `vfs`; any other parameter is a hard error (`unknown query parameter 'journal_mode'`) and the server refuses to start. SQLite pragmas are set in code instead, see "SQLite connection settings" below.
-- `DATABASE_URL` should use `mode=rw`, so a missing database file fails fast at startup. Use `mode=rwc` only when you deliberately want a file created.
+- `DATABASE_URL` should use `mode=rw`. File creation is opt-in in code (`MissingDatabase::CreateAndMigrate`), used only by `data_collector`; the API fails fast on a missing file.
 - Everything is relative to the working directory (`.env`, `server_db/`, `images/`). Run both servers from the project root (or use absolute paths / systemd `WorkingDirectory`).
 
 
 ## SQLite connection settings (WAL)
 
-Both servers open the database through **`db::connect()`** (`src/db.rs`), never `Database::connect` directly. This keeps the two processes configured identically. Every connection is opened with:
+Both servers open the database through **`db::connect(url, MissingDatabase)`** (`src/db.rs`), never `Database::connect` directly. This keeps the two processes configured identically (only the missing-database behavior differs). Every connection is opened with:
 
 | Setting | Value | Why |
 |---------|-------|-----|
@@ -139,15 +139,22 @@ Decisions and reminders:
 
 ## The database file and what happens when it is missing
 
-The schema is owned by the `migration/` crate (SeaORM migrations), **not** by either server. **Neither server creates tables or runs migrations.**
+The schema is owned by the `migration/` crate (SeaORM migrations). Whether a missing database is created is decided **in code**, via the `MissingDatabase` argument of `db::connect()` (`src/db.rs`), not by `mode=` in `DATABASE_URL`:
 
-What actually happens (verified by running the binaries). `.env` now uses `mode=rw`, so the `mode=rw` rows are the ones that apply by default:
+| Server | `MissingDatabase` | Missing file |
+|--------|-------------------|--------------|
+| `data_collector` | `CreateAndMigrate` | Creates the parent directory and the file, then runs all pending migrations (`Migrator::up`). Also applies pending migrations to an existing/empty file. |
+| `frontend_api` | `Fail` | Exits immediately with `unable to open database file`. It never creates or migrates. |
+
+The collector overrides the URL's `mode=rw` with `create_if_missing(true)`, so `.env` keeps `mode=rw` for everyone. Start the `data_collector` first on a fresh deployment; the API then finds a ready database. Auto-created databases contain the seeded `admin@admin` user from the migrations.
+
+What actually happens (verified by running the binaries with `DATABASE_URL=...?mode=rw`):
 
 | Situation | Result |
 |-----------|--------|
-| `mode=rwc`, directory exists, **file missing** | Servers **start normally** and SQLite silently creates an **empty 0-byte** file. Every DB-backed request then fails with `500` (`no such table: ...`). This is why `.env` uses `mode=rw`. |
-| `mode=rwc`, **directory (`server_db/`) missing** | Both servers **exit immediately** with `unable to open database file` (code 14). |
-| `mode=rw` (no create), file missing | Both servers **exit immediately** with `unable to open database file`. |
+| `data_collector`, **file and/or directory missing** | Creates directory + file, migrates, starts normally. |
+| `frontend_api`, **file missing** | **Exits immediately** with `unable to open database file` (code 14). |
+| `mode=rwc` in the URL, `frontend_api`, file missing | Would create an **empty 0-byte** file (the URL's `rwc` is honored when `Fail` is used), then fail with `500 no such table`. Don't use `rwc` in `.env`. |
 | Variable missing | Both servers **panic** at startup (`DATABASE_URL must be set in .env file`). |
 | File deleted **while running** | Processes **stay alive**; requests return `500`. (On Linux the open handle keeps the old inode, so behavior can vary; restart after restoring.) |
 | Tables missing (empty/unmigrated DB) | Processes **stay alive**; API returns `500` (`no such table: users`), collector returns `500` (`no such table: camera`). **Events from the Pis are rejected** until the DB is migrated. |
@@ -156,16 +163,18 @@ Design implications / reminders:
 - The failure is **loud at startup only when the file cannot be opened**. The dangerous case is `mode=rwc` with a missing file: the collector looks healthy but is silently dropping every event with `500`. Monitor for non-2xx from the collector (the Pis should retry/queue on failure).
 - Per-request DB errors never crash the processes. Handlers map DB errors to `500` and log them.
 - Neither server retries the connection: the connection is opened **once at startup**. If the DB is unavailable at boot, the process exits and must be restarted by a supervisor (systemd `Restart=on-failure`).
-- `.env` uses `mode=rw` so a missing/misplaced database fails fast instead of producing an empty one. The migration CLI is what creates the file (see below), so servers never need `rwc`.
+- `.env` uses `mode=rw` so a missing/misplaced database fails fast in the API. Only the collector creates the file, and it does so in code. A typo in `DATABASE_URL` therefore creates a fresh database when starting the collector, so check the path if the collector unexpectedly starts with no data.
+- If both servers start at the same moment against a missing database, only the collector migrates; the API fails fast and can be restarted by its supervisor.
 - Because the two servers are independent, one being down does not affect the other, but they fail **together** if they share the same missing/broken database file.
 
-### Creating / migrating the database
+### Creating / migrating the database manually
+Normally not needed (the collector does it). To do it by hand with the migration CLI:
 ```sh
 mkdir -p server_db
 cd migration
 DATABASE_URL="sqlite://../server_db/server.db?mode=rwc" cargo run -- up
 ```
-The migration command is the one place `mode=rwc` is appropriate, because it must be able to create the file. (See `migration/README.md` for the other CLI commands. Note the path is relative to `migration/`, and the shell `DATABASE_URL` caveat above applies. The migration CLI uses its own plain connection, so it does not go through `db::connect`.) The migrations create the tables and seed the `admin@admin` user. After migrating you must still insert at least one `location` -> `sublocation` -> `camera` chain before the collector will accept any event.
+The migration CLI needs `mode=rwc` to create the file. (See `migration/README.md` for the other CLI commands. Note the path is relative to `migration/`, and the shell `DATABASE_URL` caveat above applies. The migration CLI uses its own plain connection, so it does not go through `db::connect`.) The migrations create the tables and seed the `admin@admin` user. After migrating you must still insert at least one `location` -> `sublocation` -> `camera` chain before the collector will accept any event.
 
 
 ## Testing

@@ -64,7 +64,9 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------
     let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in .env file");
     println!("DATABASE_URL is:{}", db_url);
-    let db_conn = db::connect(&db_url).await?;
+    // The collector creates the database file (and runs pending migrations)
+    // if it is missing, even though DATABASE_URL says `mode=rw`.
+    let db_conn = db::connect(&db_url, db::MissingDatabase::CreateAndMigrate).await?;
 
     // ------------------------
     // 3. Prepare the image output directory
