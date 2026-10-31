@@ -27,7 +27,7 @@ table for the few cases where retrying will not help).
 ## Request
 
 ```
-POST https://<server>/api/alpr/event
+POST https://<server>/api/alpr/events
 Content-Type: application/json
 X-Collector-Token: <shared secret>
 ```
@@ -217,7 +217,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const SERVER: &str = "https://collector.example.com/api/alpr/event";
+const SERVER: &str = "https://collector.example.com/api/alpr/events";
 const TOKEN: &str = "the-shared-secret";
 
 /// The JSON the server expects. Field order does not matter, as long as the SAME
@@ -394,7 +394,7 @@ Things this example does on purpose:
 BODY='{"event_id":"11111111-2222-4333-8444-555555555555","camid":"CAM1","date":"2026-10-30T10:00:00Z","plate":"ABC1234","image":"/9j/4AAQ","plate_image":"/9j/4AAQ"}'
 echo -n "$BODY" | sha256sum        # what the Pi computes
 for i in 1 2; do                   # the second reply says "duplicate": true
-  curl -s -X POST https://collector.example.com/api/alpr/event \
+  curl -s -X POST https://collector.example.com/api/alpr/events \
        -H "X-Collector-Token: $TOKEN" -H "Content-Type: application/json" \
        --data-binary "$BODY"; echo
 done

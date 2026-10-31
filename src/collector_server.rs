@@ -1,7 +1,7 @@
 /*
  * This file contains the functions related to accepting POST-ed data from raspberry pi deployments.
  * 1. run_server() - this reads environment files to configure the database url and the address of the server.
- * 2. build_collector_server() - returns a Router which responds only to '/api/alpr/event'
+ * 2. build_collector_server() - returns a Router which responds only to '/api/alpr/events'
  * using the handler alpr_webhook_handler().
  * 3. aplr_webhook_handler()- thin HTTP wrapper around process_event().
  * 4. process_event() - validates, de-duplicates and stores one event (see below).
@@ -120,7 +120,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 // build_collector_server returns a Router with only one route.
 pub fn build_collector_server() -> Router<CollectorState> {
     Router::new()
-        .route("/api/alpr/event", post(alpr_webhook_handler))
+        .route("/api/alpr/events", post(alpr_webhook_handler))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
