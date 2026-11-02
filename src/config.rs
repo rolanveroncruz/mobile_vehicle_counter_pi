@@ -5,7 +5,7 @@
 //! | `COLLECTOR_URL`         | Collector endpoint (`http://` or `https://`)     | required                 |
 //! | `COLLECTOR_TOKEN`       | Value of the `X-Collector-Token` header          | required                 |
 //! | `PI_DB_PATH`            | Local SQLite file                                | `pi_data/pi_events.db`   |
-//! | `PI_LISTEN_ADDR`        | Where the cameras POST                           | `0.0.0.0:3000`           |
+//! | `PI_LISTEN_ADDR`        | Where nginx forwards the cameras' POSTs to       | `127.0.0.1:3000`         |
 //! | `REQUEST_TIMEOUT_SECS`  | Per-request timeout to the collector             | `60`                     |
 //! | `MAX_CAMERA_BODY_BYTES` | Cap on one camera POST                           | `67108864` (64 MB)       |
 //! | `BACKOFF_CAP_SECS`      | Longest wait between attempts for one event      | `300`                    |
@@ -15,7 +15,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub const DEFAULT_DB_PATH: &str = "pi_data/pi_events.db";
-pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:3000";
+/// Loopback only: the cameras reach the Pi through nginx (see `deploy/nginx-pi.conf`),
+/// which forwards to this address. The camera endpoint has no authentication, so
+/// it must not be exposed on the LAN directly.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:3000";
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Well above the collector's own 20 MB limit, so that an event the collector
 /// would refuse (`413`) is still stored here and fails through the normal path,
@@ -123,14 +126,21 @@ mod tests {
     }
 
     #[test]
+    fn the_camera_endpoint_listens_on_loopback_by_default() {
+        assert_eq!(DEFAULT_LISTEN_ADDR, "127.0.0.1:3000");
+    }
+
+    #[test]
     fn missing_url_or_token_is_an_error() {
         assert!(Config::from_lookup(lookup(&[("COLLECTOR_TOKEN", "x")])).is_err());
         assert!(Config::from_lookup(lookup(&[("COLLECTOR_URL", "http://a/b")])).is_err());
-        assert!(Config::from_lookup(lookup(&[
-            ("COLLECTOR_URL", "http://a/b"),
-            ("COLLECTOR_TOKEN", "   ")
-        ]))
-        .is_err());
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("COLLECTOR_URL", "http://a/b"),
+                ("COLLECTOR_TOKEN", "   ")
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -155,17 +165,21 @@ mod tests {
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.listen_addr, "127.0.0.1:4000");
 
-        assert!(Config::from_lookup(lookup(&[
-            ("COLLECTOR_URL", "https://a/b"),
-            ("COLLECTOR_TOKEN", "x"),
-            ("REQUEST_TIMEOUT_SECS", "abc"),
-        ]))
-        .is_err());
-        assert!(Config::from_lookup(lookup(&[
-            ("COLLECTOR_URL", "https://a/b"),
-            ("COLLECTOR_TOKEN", "x"),
-            ("BACKOFF_CAP_SECS", "0"),
-        ]))
-        .is_err());
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("COLLECTOR_URL", "https://a/b"),
+                ("COLLECTOR_TOKEN", "x"),
+                ("REQUEST_TIMEOUT_SECS", "abc"),
+            ]))
+            .is_err()
+        );
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("COLLECTOR_URL", "https://a/b"),
+                ("COLLECTOR_TOKEN", "x"),
+                ("BACKOFF_CAP_SECS", "0"),
+            ]))
+            .is_err()
+        );
     }
 }

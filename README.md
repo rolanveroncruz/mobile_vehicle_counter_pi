@@ -27,7 +27,7 @@ The server side (the collector, the frontend API, the database, and deployment) 
 
 ## Camera input
 
-The ALPR cameras POST JSON to the Pi at `POST /api/alpr/events` (port from `PI_LISTEN_ADDR`). The body is the collector's payload without `event_id`:
+The ALPR cameras POST JSON to `POST /api/alpr/events` on the Pi. nginx on the Pi receives the post and forwards it to the Pi client, which listens on loopback only (`PI_LISTEN_ADDR`, default `127.0.0.1:3000`); see `deploy/nginx-pi.conf` for the settings nginx needs. The body is the collector's payload without `event_id`:
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -37,7 +37,7 @@ The ALPR cameras POST JSON to the Pi at `POST /api/alpr/events` (port from `PI_L
 | `image` | string | Scene image, base64 JPEG. |
 | `plate_image` | string | Plate crop, base64 JPEG. |
 
-Extra fields are ignored and not forwarded. There is no authentication: the cameras and the Pi are alone on a LAN.
+Extra fields are ignored and not forwarded. There is no authentication: the cameras and the Pi are alone on a LAN, and the Pi client itself is reachable only through nginx.
 
 The cameras cannot retry, so **the Pi never rejects a camera post because of what it contains**:
 
@@ -57,7 +57,7 @@ Settings come from the environment or a `.env` file in the working directory (co
 | `COLLECTOR_URL` | `https://<server>/api/alpr/events`. Plain `http://` is acceptable only during initial testing. | required |
 | `COLLECTOR_TOKEN` | Shared secret sent as `X-Collector-Token` on every POST. Checked by nginx on the server, so it must match the secret configured there. The token is only secret on an encrypted connection, so use `https://` in production. | required |
 | `PI_DB_PATH` | Local SQLite file where every event, its exact request body and its delivery status are stored. It must survive reboots and power loss. Events are never deleted by the program. | `pi_data/pi_events.db` |
-| `PI_LISTEN_ADDR` | Where the cameras POST. | `0.0.0.0:3000` |
+| `PI_LISTEN_ADDR` | Where nginx forwards the cameras' posts to. Keep it on loopback: the endpoint has no authentication. | `127.0.0.1:3000` |
 | `REQUEST_TIMEOUT_SECS` | Timeout of one request to the collector (30-60 s recommended, see "Retry behaviour"). | `60` |
 | `BACKOFF_CAP_SECS` | Longest wait between attempts for one event. | `300` |
 | `MAX_CAMERA_BODY_BYTES` | Largest camera post accepted. Well above the collector's 20 MB. | `67108864` |
