@@ -1,24 +1,21 @@
 [package]
-name = "mobile_vehicle_counter_server"
+name = "mobile_vehicle_counter_pi"
 version = "0.1.0"
 edition = "2024"
-default-run = "run_frontend_api"
+default-run = "run_pi_client"
 
 [dependencies]
 axum = "0.8.9"
 tokio = { version = "1.53.2", features = ["full"] }
-serde={ version = "1.0.229", features = ["derive"]}
-base64="0.23.1"
-uuid={version = "1.28.0", features = ["v4", "serde"]}
-tower-http = {version="0.7.1", features = ["cors"]}
-rusqlite = {version="0.35.0", features = ["bundled"]}
-jsonwebtoken = "9.3.1"
-chrono = '0.4.45'
-argon2 =  "0.6.0"
-sea-orm = { version="2.0.4", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros",] }
-dotenvy = "0.15.7"
-tower= {  version="0.5.3", features = ["util"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+uuid = { version = "1.28.0", features = ["v4"] }
 sha2 = "0.10.9"
 hex = "0.4.3"
-migration = { path = "migration" }
+rusqlite = { version = "0.35.0", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+dotenvy = "0.15.7"
+rand = "0.9"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
