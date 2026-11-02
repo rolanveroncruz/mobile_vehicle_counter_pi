@@ -4,7 +4,7 @@ This is Autonomous Systems Inc.'s project to count vehicles and analyze traffic 
 
 This specific project is the server's Pi client. It accepts POSTed data from automatic license plate recognition (ALPR) cameras and relays it to the collector server. Because the collector server is a long distance away over the internet, this Pi client must retry sending data when attempts fail, without losing or duplicating events.
 
-The code of this Pi client is derived from the collector server's, since they share a similar structure and function. As a result, some leftovers from the server project (for example the crate name `mobile_vehicle_counter_server` in `Cargo.toml`) have not been renamed yet.
+The program is the binary `run_pi_client` of the crate `mobile_vehicle_counter_pi`. It runs two things in one process: the endpoint the cameras POST to, and the sender that delivers stored events to the collector.
 
 ## Architecture
 
@@ -18,21 +18,61 @@ flowchart LR
     COL -->|200 + content_hash| PI
 ```
 
-1. A camera posts a vehicle ALPR event to the Pi.
+1. A camera posts a vehicle ALPR event to the Pi (see "Camera input" below). The Pi answers `200` only after the event is committed to its database.
 2. The Pi assigns the event a random `event_id`, builds the final request body **once**, and saves it (the exact bytes) in a local SQLite database with status `pending`.
 3. The sender POSTs the saved bytes to the collector, over HTTP to start, but later over HTTPS, through nginx.
 4. The Pi updates the event's status in the database: `delivered` once the collector's receipt is verified (it was received and correctly inserted by the collector server), or `failed` if the collector rejects it in a way that retrying cannot fix. Otherwise it stays `pending` and is retried.
 
 The server side (the collector, the frontend API, the database, and deployment) lives in the `mobile_vehicle_counter_server` project. The implementation of the collector endpoint is `src/collector_server.rs` there, and its `tests/collector_test.rs` shows every case below as an executable example.
 
+## Camera input
+
+The ALPR cameras POST JSON to the Pi at `POST /api/alpr/events` (port from `PI_LISTEN_ADDR`). The body is the collector's payload without `event_id`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `camid` | string | Must match a camera registered on the server. |
+| `date` | string | RFC 3339 with an offset. The Pi does not check it. |
+| `plate` | string | Recognised plate text. |
+| `image` | string | Scene image, base64 JPEG. |
+| `plate_image` | string | Plate crop, base64 JPEG. |
+
+Extra fields are ignored and not forwarded. There is no authentication: the cameras and the Pi are alone on a LAN.
+
+The cameras cannot retry, so **the Pi never rejects a camera post because of what it contains**:
+
+- Valid JSON with all five fields becomes a `pending` event with a new `event_id`.
+- Anything else (invalid JSON, a missing or non-string field) is stored as a `failed` row holding the camera's raw bytes, with `last_error` starting `unparseable camera payload`. It is never sent and is kept for inspection.
+- A bad `date` is sent as it is. The collector answers `400` and the event becomes `failed` through the normal path.
+- An event too large for the collector (over 20 MB) is still stored. The collector answers `413` and the event becomes `failed`.
+- The reply is `200` only after the row is committed. If the database cannot be written (for example the disk is full) the Pi answers `500`, because it cannot honestly say the event is stored. The camera cannot retry, so that event is lost and an `ERROR EVENT LOST` line is logged. Keep free space on the SD card.
+- The only content-independent refusal is a body above `MAX_CAMERA_BODY_BYTES` (`413`), which stops a faulty camera filling the card.
+
 ## Configuration
 
-| Setting | Meaning |
-|---------|---------|
-| Collector URL | `https://<server>/api/alpr/events` |
-| `X-Collector-Token` | Shared secret sent on every POST. Checked by nginx on the server, so it must match the secret configured there. Always use `https://`, because the token is only secret on an encrypted connection. (Plain HTTP is acceptable only during initial testing.) |
-| Local database | SQLite file where every event, its exact request body and its delivery status are stored. It must survive reboots and power loss. Events are never deleted by the protocol. |
-| Request timeout | 30-60 s recommended (see "Retry behaviour"). |
+Settings come from the environment or a `.env` file in the working directory (copy `.env.example`; `.env` holds a secret and is not committed).
+
+| Setting | Meaning | Default |
+|---------|---------|---------|
+| `COLLECTOR_URL` | `https://<server>/api/alpr/events`. Plain `http://` is acceptable only during initial testing. | required |
+| `COLLECTOR_TOKEN` | Shared secret sent as `X-Collector-Token` on every POST. Checked by nginx on the server, so it must match the secret configured there. The token is only secret on an encrypted connection, so use `https://` in production. | required |
+| `PI_DB_PATH` | Local SQLite file where every event, its exact request body and its delivery status are stored. It must survive reboots and power loss. Events are never deleted by the program. | `pi_data/pi_events.db` |
+| `PI_LISTEN_ADDR` | Where the cameras POST. | `0.0.0.0:3000` |
+| `REQUEST_TIMEOUT_SECS` | Timeout of one request to the collector (30-60 s recommended, see "Retry behaviour"). | `60` |
+| `BACKOFF_CAP_SECS` | Longest wait between attempts for one event. | `300` |
+| `MAX_CAMERA_BODY_BYTES` | Largest camera post accepted. Well above the collector's 20 MB. | `67108864` |
+
+## Running and testing
+
+```sh
+cargo run --release --bin run_pi_client      # needs .env
+cargo test                                   # unit and integration tests
+tests/contract.sh                            # real Pi client against the real collector
+```
+
+`tests/contract.sh` builds and starts the collector from the sibling `mobile_vehicle_counter_server` project on a temporary database, drives the Pi client like a camera, and checks delivery, a retry after an unregistered camera, a bad date, unparseable input and a duplicate. It needs `curl` and `sqlite3`. `deploy/mobile-vehicle-pi.service` is a draft systemd unit.
+
+Operations: a `failed` event is logged as `ERROR ALERT`. After fixing the cause it can be retried with `UPDATE events SET status='pending', next_attempt_at=0 WHERE event_id='...';`, which sends the same bytes.
 
 ---
 
@@ -62,11 +102,13 @@ Each event is one row in the Pi's local SQLite database. The essential fields ar
 | `attempts` | Number of delivery attempts so far. |
 | `created_at` | When the event was stored. Pending events are sent oldest first. |
 | `delivered_at` | When the verified receipt was received. |
+| `next_attempt_at` | Extra. Earliest time (Unix milliseconds) of the next attempt. Lets an event that has to wait not block newer ones. |
+| `last_error` | Extra. Why the last attempt did not succeed, or why the row is `failed`. |
 
 Rules:
 
 - The row is inserted in a single transaction, and the database is configured so that a committed event survives a power cut.
-- Rows are **updated, never deleted**, by the delivery logic. Only the status, attempt count and delivery time change.
+- Rows are **updated, never deleted**, by the delivery logic. Only the status, attempt count, delivery time, `next_attempt_at` and `last_error` change.
 - The `body` is stored as bytes, not rebuilt from other columns (see "Pitfalls"). Extra columns for querying are fine.
 
 ## Request
@@ -168,7 +210,7 @@ In short, each delivery attempt ends in one of three outcomes:
 |---------|-----------|------|
 | Delivered | `delivered` | Verified `200`. |
 | Retry | stays `pending` | Timeouts, connection errors, `401` (until the token is fixed), `422`, `429`, `5xx`, or a `200` whose receipt does not match. |
-| Reject | `failed` | `400`, `403`, `404`, `409`, `413`, or a corrupt stored body. Raise an alert. |
+| Reject | `failed` | `400`, `403`, `404`, `409`, `413`, a corrupt stored body, or any other status not listed above (for example a redirect). Raise an alert. |
 
 ### Why retrying after a timeout is safe
 

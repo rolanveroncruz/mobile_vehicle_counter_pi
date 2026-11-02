@@ -1,0 +1,69 @@
+# systemd unit for the Pi client (run_pi_client).
+#
+# DRAFT: review every line marked "CHANGE" before using it.
+#
+# Install:
+#   sudo cp deploy/mobile-vehicle-pi.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mobile-vehicle-pi
+#
+# Watch it:
+#   systemctl status mobile-vehicle-pi
+#   journalctl -u mobile-vehicle-pi -f
+#   journalctl -u mobile-vehicle-pi | grep ALERT      # events that became 'failed'
+#
+# Only ONE instance may run per database file.
+
+[Unit]
+Description=Mobile Vehicle Counter - Pi client (receives ALPR events from the cameras, delivers them to the collector)
+# The cameras and the collector are both reached over the network.
+After=network-online.target
+Wants=network-online.target
+# Do not let systemd give up on a crash loop: at most 10 starts per 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+
+# CHANGE: the account that runs the service. Create it once with:
+#   sudo useradd --system --home-dir /opt/mobile_vehicle_counter_pi --shell /usr/sbin/nologin mvc
+# Do not run it as root.
+User=mvc
+Group=mvc
+
+# CHANGE: the project root on the Pi. The program reads `.env` and the relative
+# PI_DB_PATH from the *current directory*, so this MUST be the directory that
+# contains `.env` and `pi_data/`.
+WorkingDirectory=/opt/mobile_vehicle_counter_pi
+
+# CHANGE: path to the release binary. Build it with:
+#   cargo build --release --locked --bin run_pi_client
+ExecStart=/opt/mobile_vehicle_counter_pi/target/release/run_pi_client
+
+# Settings come from `.env` in WorkingDirectory. Anything exported in the
+# environment wins over `.env`. Protect the file, it holds the shared secret:
+#   sudo chown mvc:mvc .env && sudo chmod 600 .env
+
+# Restart if it crashes or fails to start (for example a bad .env).
+Restart=on-failure
+RestartSec=5
+
+# SIGTERM makes the program finish the camera posts in flight and exit. Cameras
+# cannot retry, so give it a little time rather than killing it quickly.
+TimeoutStopSec=30
+
+# --- Hardening (safe defaults; loosen only if something is blocked) ---------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# With ProtectSystem=strict the filesystem is read-only for this service except
+# the paths listed here. The Pi client writes only its SQLite database (including
+# the -wal/-shm side files).
+# CHANGE: this must be the directory of PI_DB_PATH in `.env`. Create it first:
+#   sudo install -d -o mvc -g mvc /opt/mobile_vehicle_counter_pi/pi_data
+ReadWritePaths=/opt/mobile_vehicle_counter_pi/pi_data
+
+[Install]
+WantedBy=multi-user.target

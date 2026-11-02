@@ -1,6 +1,6 @@
 # Plan: make `mobile_vehicle_counter_pi` conform to `README.md`
 
-Status: **draft for review. No code has been changed yet.**
+Status: **executed.** Sections 3-8 were carried out (server code removed, new modules and tests written, README and TODO updated). Open points in section 10 were resolved with the defaults described there, and are tracked in `TODO.md`.
 
 `README.md` is the specification. This plan describes how to turn the current project, which is a copy of the collector server, into the Pi client the README describes.
 
