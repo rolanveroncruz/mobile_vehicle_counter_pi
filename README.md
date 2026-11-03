@@ -67,8 +67,11 @@ Settings come from the environment or a `.env` file in the working directory (co
 ```sh
 cargo run --release --bin run_pi_client      # needs .env
 cargo test                                   # unit and integration tests
-tests/contract.sh                            # real Pi client against the real collector
+tests/contract.sh                            # development: Pi client against a local copy of the collector
+deploy/check-delivery.sh [CAMID]             # on the Pi: one test event through to the REAL collector
 ```
+
+`deploy/check-delivery.sh` posts one camera-style event to the running Pi client and waits for its database to say `delivered`, which proves the whole path (network, HTTPS, nginx token, collector). It needs `curl` and `sqlite3`, and the `CAMID` must be registered on the server. The test event (plate `CHK...`) is really stored on the collector, so delete it afterwards.
 
 `tests/contract.sh` builds and starts the collector from the sibling `mobile_vehicle_counter_server` project on a temporary database, drives the Pi client like a camera, and checks delivery, a retry after an unregistered camera, a bad date, unparseable input and a duplicate. It needs `curl` and `sqlite3`. `deploy/mobile-vehicle-pi.service` is a draft systemd unit.
 
